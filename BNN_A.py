@@ -278,7 +278,7 @@ def calculate_rmse(y_true_normalized, y_pred_normalized, y_min, y_max):
     y_pred_unnormalized = y_pred_normalized * (y_max - y_min) + y_min
     return torch.sqrt(torch.mean((y_true_unnormalized - y_pred_unnormalized) ** 2)).item()
 
-def calculate_single_row_features(df_past, feature_cols, lookback_window=10):
+def calculate_single_row_features(df_past, feature_cols, lookback_window):
     df_single = df_past.copy()
 
     required_for_features = ['Close', 'Volume']
@@ -385,10 +385,7 @@ def init_loc_fn(site):
     return torch.zeros(param_shape, device=device)
 
 def train_model(ticker):
-    stock_df = get_stock_data(ticker, start_date='2018-01-01', end_date=datetime.now().strftime('%Y-%m-%d'))
-
-    lookback_window = 10 ## Could change this for different lookback weighting (e.g. decay for larger window size)
-    prediction_horizon = 3 ## Number of days to predict into the future
+    stock_df = get_stock_data(ticker, start_date='2018-01-01', end_date=datetime.now().strftime('%Y-%m-%d'), lookback_window=lookback_window, prediction_horizon=prediction_horizon)
 
     x_data_full_unnorm, y_data_full_unnorm, dates_full, _, input_dim_determined, last_prices_full = \
     prepare_stock_data(stock_df, lookback_window=lookback_window, prediction_horizon=prediction_horizon)
@@ -574,9 +571,126 @@ def train_model(ticker):
                 finally:
                     bnn.train()
     return bnn, guide, scaling_info, lookback_window
+
+
+def multi_step_forecast_pyro(latest_stock_df, bnn, guide, scaling_info, lookback_window, features_cols_for_future, device, horizon=5, n_paths=10, n_samples_per_pred=50):
+    """
+    Performs multi-step forecasting using Monte Carlo paths to propagate uncertainty.
+    Each path simulates a sequence of predictions, updating the DataFrame with sampled closes.
+    Aggregates across paths to get mean and std for each horizon.
+    """
+    if len(latest_stock_df) < lookback_window:
+        print(f"Not enough data in latest_stock_df for {lookback_window}-day lookback.")
+        return []
+
+    # Precompute future dates (deterministic, same for all paths)
+    future_dates = []
+    current_date = latest_stock_df.index[-1]
+    for _ in range(horizon):
+        next_date = current_date + timedelta(days=1)
+        while next_date.weekday() >= 5:
+            next_date += timedelta(days=1)
+        future_dates.append(next_date)
+        current_date = next_date
+
+    # List of lists: Collect predicted closes for each horizon across all paths
+    all_pred_closes = [[] for _ in range(horizon)]
+
+    for path in range(n_paths):
+        current_df = latest_stock_df.copy()  # Each path starts with a copy of the original DF
+
+        for step in range(horizon):
+            if len(current_df) < lookback_window:
+                break  # Skip if not enough history (unlikely after initial check)
+
+            # Prepare input features
+            input_for_features_np = calculate_single_row_features(current_df, features_cols_for_future)
+
+            # Normalize
+            input_norm = (input_for_features_np - scaling_info['x_min'].cpu().numpy()) / (scaling_info['x_max'].cpu().numpy() - scaling_info['x_min'].cpu().numpy() + 1e-8)  # Avoid div by zero
+            input_tensor = torch.tensor(input_norm, dtype=torch.float32).to(device).unsqueeze(0)  # Add batch dim
+
+            # Make prediction using Pyro Predictive
+            bnn.eval()
+            with torch.no_grad():
+                predictive = Predictive(bnn, guide=guide, num_samples=n_samples_per_pred, return_sites=("_RETURN",))
+                samples = predictive(input_tensor)
+
+                mean_pred_normalized = samples["_RETURN"].mean(0).squeeze()  # Assume scalar output
+                std_pred_normalized = samples["_RETURN"].std(0).squeeze()
+
+            # Inverse transform to unnormalized return
+            y_min, y_max = scaling_info['y_min'], scaling_info['y_max']
+            predicted_return_unnorm = mean_pred_normalized * (y_max - y_min) + y_min
+            predicted_std_return_unnorm = std_pred_normalized * (y_max - y_min)
+
+            # Sample a return for this path (propagate uncertainty)
+            sampled_return = np.random.normal(predicted_return_unnorm.item(), predicted_std_return_unnorm.item())
+
+            # Compute new close
+            last_close = current_df['Close'].iloc[-1]
+            new_close = last_close * (1 + sampled_return)
+
+            # Collect this predicted close for aggregation
+            all_pred_closes[step].append(new_close)
+
+            # Create and append new row to current_df for next step
+            next_date = future_dates[step]
+            last_row = current_df.iloc[-1].copy()
+            new_row = pd.Series(index=last_row.index, data=last_row.values, name=next_date)
+            new_row['Close'] = new_close
+
+            # Handle other columns if present (simplifications)
+            if 'Volume' in new_row:
+                new_row['Volume'] = current_df['Volume'].iloc[-1]  # Carry forward last volume
+            if 'Open' in new_row:
+                new_row['Open'] = new_close  # Approximate
+            if 'High' in new_row:
+                new_row['High'] = new_close
+            if 'Low' in new_row:
+                new_row['Low'] = new_close
+
+            current_df = pd.concat([current_df, new_row.to_frame().T])
+
+            # Recompute any necessary indicators? (Handled by calculate_single_row_features in next iteration)
+
+    # Aggregate: For each horizon, compute mean close, std close, and derive ranges
+    forecasts = []
+    for step, closes in enumerate(all_pred_closes):
+        if closes:
+            mean_close = np.mean(closes)
+            std_close = np.std(closes)
+
+            # Approximate ±2 std range (95% CI assuming normal)
+            lower_bound = mean_close - 2 * std_close
+            upper_bound = mean_close + 2 * std_close
+
+            forecasts.append({
+                'date': future_dates[step].strftime('%Y-%m-%d'),
+                'mean_close': mean_close,
+                'std_close': std_close,
+                'lower_bound': lower_bound,
+                'upper_bound': upper_bound
+            })
+        else:
+            forecasts.append({
+                'date': future_dates[step].strftime('%Y-%m-%d'),
+                'mean_close': np.nan,
+                'std_close': np.nan,
+                'lower_bound': np.nan,
+                'upper_bound': np.nan
+            })
+
+    return forecasts
                 
 
 if __name__ == "__main__":
+
+    lookback_window = 10
+    horizon = 20
+    n_paths = 100
+    n_samples_per_pred = 50
+    
     for ticker in tickers:
         try:
             bnn, guide, scaling_info, lookback_window = train_model(ticker=ticker)
@@ -609,24 +723,14 @@ if __name__ == "__main__":
             input_for_future_norm = (input_for_future_features_np - scaling_info['x_min'].cpu().numpy()) / scaling_info['x_max'].cpu().numpy()
             input_for_future_tensor = torch.tensor(input_for_future_norm, dtype=torch.float32).to(device).unsqueeze(0)
 
-            bnn.eval()
-            with torch.no_grad():
-                predictive_future = Predictive(bnn, guide=guide, num_samples=500, return_sites=("_RETURN",))
-                samples_future = predictive_future(input_for_future_tensor)
+            forecasts = multi_step_forecast_pyro(latest_stock_df, bnn, guide, scaling_info, lookback_window, current_features, device, horizon=horizon, n_paths=n_paths, n_samples_per_pred=n_samples_per_pred)
+            predicted_close_for_future = forecasts[-1]['mean_close']
 
-                mean_pred_normalized_future = samples_future["_RETURN"].mean(0)
-                std_pred_normalized_future = samples_future["_RETURN"].std(0)
+            lower_bound_price = forecasts[-1]['lower_bound']
+            upper_bound_price = forecasts[-1]['upper_bound']
+            pred_std = forecasts[-1]['std_close']
 
-            y_min, y_max = scaling_info['y_min'], scaling_info['y_max']
-            predicted_return_unnorm = mean_pred_normalized_future * (y_max - y_min) + y_min
-            pred_std_return_unnorm = std_pred_normalized_future * (y_max - y_min)
-
-            predicted_close_for_future = last_actual_close_price * (1 + predicted_return_unnorm.item())
-
-            lower_bound_price = last_actual_close_price * (1 + predicted_return_unnorm.item() - 2 * pred_std_return_unnorm.item())
-            upper_bound_price = last_actual_close_price * (1 + predicted_return_unnorm.item() + 2 * pred_std_return_unnorm.item())
-
-            print(f"Predicted return for future (unnormalized): {predicted_return_unnorm.item():.4f}")
+            print(f"Predicted Close: {predicted_close_for_future:.4f}")
 
             next_trading_day = latest_stock_df.index[-1] + timedelta(days=3) ## days = # of days ahead to predict
             while next_trading_day.weekday() >= 5:
@@ -634,7 +738,7 @@ if __name__ == "__main__":
 
             print(f"Predicted close price for {ticker} on {next_trading_day.strftime('%Y-%m-%d')}: {predicted_close_for_future:.2f}")
             print(f"Lower bound price: {lower_bound_price:.2f}, Upper bound price: {upper_bound_price:.2f}")
-            print(f"Uncertainty (approx. += 2 std dev of Return): +={2 * pred_std_return_unnorm.item():.4f} on return scale, or +={2 * pred_std_return_unnorm.item() * last_actual_close_price:.2f} on price scale")
+            print(f"Uncertainty (approx. += 2 std dev of Return): +={2 * pred_std:.4f} on return scale, or +={2 * pred_std * last_actual_close_price:.2f} on price scale")
 
             def get_signal():
 
