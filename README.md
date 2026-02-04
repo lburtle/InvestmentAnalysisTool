@@ -1,6 +1,8 @@
 # Investment Analysis Tool
 
-This is a research-oriented tool designed to integrate **Bayesian Probabilistic Modeling** with **Natural Language Processing** to analyze financial markets. 
+For sake of naming, I will just refer to it as Market Prediction Tool (MPT)
+
+**MPT** is a research-oriented tool designed to integrate **Bayesian Probabilistic Modeling** with **Natural Language Processing** to analyze financial markets. 
 
 The project explores how combining uncertainty-aware price prediction (using Hybrid Bayesian Neural Networks) with fundamental market sentiment (using Transformer-based Large Language Models) can create a robust holistic market view.
 
