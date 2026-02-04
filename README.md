@@ -79,5 +79,3 @@ The tool operates on a dual-signal methodology:
 
 By analyzing the divergence or convergence of these two signals, MPT aims to identify high-probability trade setups that are backed by both math and news.
 
----
-*Status: Active Research / WIP*
